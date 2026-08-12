@@ -437,7 +437,7 @@ def run_bot_engine():
         time.sleep(POLL_INTERVAL)
 
 # ==========================================
-# DUMMY HTTP SERVER (UNTUK MENGATASI PORT RAILWAY)
+# SAFE DUMMY HTTP SERVER (UNTUK PORT RAILWAY)
 # ==========================================
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -448,15 +448,20 @@ class HealthHandler(BaseHTTPRequestHandler):
         pass
 
 def start_health_server():
-    port = int(os.getenv("PORT", 8080))
+    try:
+        port_env = os.getenv("PORT")
+        port = int(port_env) if port_env and str(port_env).isdigit() else 8080
+    except:
+        port = 8080
+
     try:
         server = HTTPServer(("0.0.0.0", port), HealthHandler)
         server.serve_forever()
     except Exception as e:
-        log.warning(f"Health server warning: {e}")
+        print(f"Health server warning: {e}")
 
 if __name__ == "__main__":
-    # Jalankan server mini di background agar Railway mendeteksi port aktif
+    # Jalankan server mini di background secara aman
     threading.Thread(target=start_health_server, daemon=True).start()
 
     print("Adaptive Multi-TF Bot XAU/USD AKTIF")
@@ -466,9 +471,9 @@ if __name__ == "__main__":
         try:
             run_bot_engine()
         except KeyboardInterrupt:
-            log.info("Bot dihentikan manual oleh user.")
+            print("Bot dihentikan manual oleh user.")
             send_telegram_message("🛑 Bot dihentikan manual.")
             break
         except Exception as crash_error:
-            log.critical(f"Bot mengalami crash fatal: {crash_error}. Auto-restart dalam 30 detik...")
+            print(f"Bot mengalami crash fatal: {crash_error}. Auto-restart dalam 30 detik...")
             time.sleep(30)
