@@ -25,15 +25,15 @@ import numpy as np
 from datetime import datetime, timezone, date, timedelta
 
 # ==========================================
-# KREDENSIAL (ISI DI SINI)
+# KREDENSIAL (DIAMBIL OTOMATIS DARI RAILWAY VARIABLES)
 # ==========================================
-TWELVE_API_KEY = "5e272bcdc25544"
-TG_TOKEN       = "8488792485:AAHQ35Pu1gdUtyGqP"
-TG_CHAT_ID     = "-1004416220423"
+TWELVE_API_KEY = os.getenv("TWELVE_API_KEY", "")
+TG_TOKEN       = os.getenv("TG_TOKEN", "")
+TG_CHAT_ID     = os.getenv("TG_CHAT_ID", "")
 
 _PLACEHOLDER_MARK = "ISI_"
 def _is_placeholder(val: str) -> bool:
-    return isinstance(val, str) and val.startswith(_PLACEHOLDER_MARK)
+    return isinstance(val, str) and (not val.strip() or val.startswith(_PLACEHOLDER_MARK))
 
 # ==========================================
 # KONFIGURASI PARAMETER
@@ -97,7 +97,7 @@ logging.basicConfig(
 log = logging.getLogger("AbahFK_Bot")
 
 def send_telegram_message(message: str):
-    if not TG_TOKEN or _is_placeholder(TG_TOKEN):
+    if not TG_TOKEN or _is_placeholder(TG_TOKEN) or not TG_CHAT_ID:
         return
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     payload = {"chat_id": TG_CHAT_ID, "text": message, "parse_mode": "HTML"}
@@ -114,7 +114,7 @@ def send_telegram_message(message: str):
 # ==========================================
 def check_telegram_commands():
     global bot_is_paused, last_telegram_update_id
-    if not TG_TOKEN or _is_placeholder(TG_TOKEN):
+    if not TG_TOKEN or _is_placeholder(TG_TOKEN) or not TG_CHAT_ID:
         return
 
     url = f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates?offset={last_telegram_update_id + 1}&timeout=1"
@@ -353,8 +353,6 @@ def mark_tf_signal(tf: str, direction: str):
 # ==========================================
 def run_bot_engine():
     global total_signals_sent
-    log.info("Adaptive Multi-TF Bot XAU/USD AKTIF")
-    send_telegram_message("🚀 <b>Adaptive Multi-TF Bot XAU/USD Aktif & Berjalan</b>\nMemindai seluruh Timeframe secara independen.")
 
     while True:
         try:
@@ -438,6 +436,9 @@ def run_bot_engine():
         time.sleep(POLL_INTERVAL)
 
 if __name__ == "__main__":
+    log.info("Adaptive Multi-TF Bot XAU/USD AKTIF")
+    send_telegram_message("🚀 <b>Adaptive Multi-TF Bot XAU/USD Aktif & Berjalan</b>\nMemindai seluruh Timeframe secara independen.")
+
     while True:
         try:
             run_bot_engine()
