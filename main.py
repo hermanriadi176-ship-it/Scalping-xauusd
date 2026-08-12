@@ -9,7 +9,7 @@ Fitur:
 4. Manajemen Risiko Riil (Position Sizing, Daily Loss & Consecutive Loss Tracker)
 5. Filter Kalender Ekonomi ForexFactory (Auto-Pause saat High-Impact News)
 6. Interactive Command Telegram (/status, /pause, /resume, /stats)
-7. Garbage Collection & Auto-Restart Wrapper
+7. Built-in Web Server (Untuk mencegah kontainer Railway mati otomatis)
 8. Pesan Personal Abah FK
 ================================================================================
 """
@@ -22,7 +22,9 @@ import logging
 import requests
 import pandas as pd
 import numpy as np
+import threading
 from datetime import datetime, timezone, date, timedelta
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ==========================================
 # KREDENSIAL (DIAMBIL OTOMATIS DARI RAILWAY VARIABLES)
@@ -65,7 +67,6 @@ ECON_IMPACT_LEVELS = ["High"]
 ECON_COUNTRIES = ["USD"]
 ECON_WINDOW_MIN = 30
 ECON_CHECK_INTERVAL = 1800
-ECON_LOCAL_FEED = ""
 
 # ==========================================
 # STATE GLOBAL & INTERACTIVE CONTROLS
@@ -435,7 +436,29 @@ def run_bot_engine():
         
         time.sleep(POLL_INTERVAL)
 
+# ==========================================
+# DUMMY HTTP SERVER (UNTUK MENGATASI PORT RAILWAY)
+# ==========================================
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is active and running!")
+    def log_message(self, format, *args):
+        pass
+
+def start_health_server():
+    port = int(os.getenv("PORT", 8080))
+    try:
+        server = HTTPServer(("0.0.0.0", port), HealthHandler)
+        server.serve_forever()
+    except Exception as e:
+        log.warning(f"Health server warning: {e}")
+
 if __name__ == "__main__":
+    # Jalankan server mini di background agar Railway mendeteksi port aktif
+    threading.Thread(target=start_health_server, daemon=True).start()
+
     print("Adaptive Multi-TF Bot XAU/USD AKTIF")
     send_telegram_message("🚀 <b>Adaptive Multi-TF Bot XAU/USD Aktif & Berjalan</b>\nMemindai seluruh Timeframe secara independen.")
 
