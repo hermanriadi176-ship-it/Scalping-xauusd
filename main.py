@@ -436,7 +436,7 @@ def run_bot_engine():
         time.sleep(POLL_INTERVAL)
 
 if __name__ == "__main__":
-    log.info("Adaptive Multi-TF Bot XAU/USD AKTIF")
+    print("Adaptive Multi-TF Bot XAU/USD AKTIF")
     send_telegram_message("🚀 <b>Adaptive Multi-TF Bot XAU/USD Aktif & Berjalan</b>\nMemindai seluruh Timeframe secara independen.")
 
     while True:
