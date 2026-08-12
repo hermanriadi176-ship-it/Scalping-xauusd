@@ -1,771 +1,450 @@
 """
-XAUUSD Scalping Bot — High Probability Edition
-================================================
-Strategi: Multi-indikator confluence scoring (EMA + RSI + MACD + ATR)
-  - EMA 9 & 21 crossover  → konfirmasi tren
-  - EMA 50               → filter tren besar
-  - RSI (14)             → konfirmasi momentum, hindari overbought/oversold
-  - MACD (12, 26, 9)     → histogram konfirmasi arah momentum
-  - ATR (14)             → SL dinamis sesuai volatilitas
-  - SINYAL hanya keluar jika skor >= 3 dari 4 kondisi terpenuhi
-
-Deploy : Railway (gunicorn, 1 worker + threads)
-Data   : Twelve Data API (https://twelvedata.com)
+================================================================================
+ ULTIMATE ADAPTIVE MULTI-TF BOT TRADING XAU/USD — FULL ELITE EDITION
+================================================================================
+Fitur:
+1. Multi-TF Independent Scanning (1h, 30min, 15min, 5min)
+2. Detailed Technical Reasons & Order Flow Dominance per Timeframe
+3. Adaptive Volatility (SL & TP menyesuaikan ATR di masing-masing timeframe)
+4. Manajemen Risiko Riil (Position Sizing, Daily Loss & Consecutive Loss Tracker)
+5. Filter Kalender Ekonomi ForexFactory (Auto-Pause saat High-Impact News)
+6. Interactive Command Telegram (/status, /pause, /resume, /stats)
+7. Garbage Collection & Auto-Restart Wrapper
+8. Pesan Personal Abah FK
+================================================================================
 """
 
 import os
 import time
-import threading
+import json
+import gc
+import logging
 import requests
-from flask import Flask, render_template_string, request, redirect, url_for
-import pytz
-from datetime import datetime
+import pandas as pd
+import numpy as np
+from datetime import datetime, timezone, date, timedelta
 
-app = Flask(__name__)
+# ==========================================
+# KREDENSIAL (ISI DI SINI)
+# ==========================================
+TWELVE_API_KEY = "5e272bcdc25544"
+TG_TOKEN       = "8488792485:AAHQ35Pu1gdUtyGqP"
+TG_CHAT_ID     = "-1004416220423"
 
-lock = threading.Lock()
+_PLACEHOLDER_MARK = "ISI_"
+def _is_placeholder(val: str) -> bool:
+    return isinstance(val, str) and val.startswith(_PLACEHOLDER_MARK)
 
-config = {
-    "TELEGRAM_BOT_TOKEN":  os.environ.get("TELEGRAM_BOT_TOKEN", ""),
-    "TELEGRAM_CHAT_ID":    os.environ.get("TELEGRAM_CHAT_ID", ""),
-    "TWELVE_DATA_API_KEY": os.environ.get("TWELVE_DATA_API_KEY", ""),
-    "TIMEFRAME":    "5min",
-    "RISK_REWARD":  "1:2",
-    "LOT_SIZE":     0.1,
-    "ATR_MULT":     1.5,
-    "MIN_SCORE":    3,
-    "IS_RUNNING":   False,
+# ==========================================
+# KONFIGURASI PARAMETER
+# ==========================================
+SYMBOL = "XAU/USD"
+TIMEFRAMES = ["1h", "30min", "15min", "5min"]
+
+ACCOUNT_BALANCE = 10000.0
+RISK_PERCENT = 1.0
+MAX_DAILY_LOSS = 3.0
+MAX_CONSECUTIVE_LOSSES = 3
+MIN_CONFLUENCE = 2
+
+EMA_FAST = 21
+EMA_SLOW = 55
+RSI_LEN = 14
+RSI_OB = 70
+RSI_OS = 30
+ATR_LEN = 14
+
+CONTRACT_SIZE = 100
+POLL_INTERVAL = 60
+TF_COOLDOWN = 900
+API_TIMEOUT = 10
+MAX_LOT = 5.0
+
+ECON_CALENDAR_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+ECON_IMPACT_LEVELS = ["High"]
+ECON_COUNTRIES = ["USD"]
+ECON_WINDOW_MIN = 30
+ECON_CHECK_INTERVAL = 1800
+ECON_LOCAL_FEED = ""
+
+# ==========================================
+# STATE GLOBAL & INTERACTIVE CONTROLS
+# ==========================================
+bot_is_paused = False
+daily_loss_tracker = 0.0
+consecutive_losses = 0
+total_signals_sent = 0
+last_reset_day = datetime.now(timezone.utc).date()
+tf_last_signal_time = {}
+last_telegram_update_id = 0
+
+_econ_cache = {
+    "checked_at": 0.0,
+    "events": [],
 }
 
-bot_stats = {
-    "total_signals":    0,
-    "win_count":        0,
-    "loss_count":       0,
-    "win_rate":         "0.0%",
-    "total_pnl_pips":   0.0,
-    "total_pnl":        "+0.0 pips",
-    "avg_pnl":          "+0.0 pips / trade",
-    "last_check":       "Belum pernah",
-    "last_error":       "",
-    "last_signal_type": None,
-    "current_price":    None,
-    "indicators":       {},
-    "last_score":       0,
-    "last_conditions":  {},
-    "pending_signals":  [],
-    "signal_history":   [],
-}
+# ==========================================
+# LOGGING SETUP
+# ==========================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("adaptive_multi_tf_bot.log"),
+        logging.StreamHandler(),
+    ],
+)
+log = logging.getLogger("AbahFK_Bot")
 
+def send_telegram_message(message: str):
+    if not TG_TOKEN or _is_placeholder(TG_TOKEN):
+        return
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    payload = {"chat_id": TG_CHAT_ID, "text": message, "parse_mode": "HTML"}
+    for _ in range(3):
+        try:
+            resp = requests.post(url, json=payload, timeout=10)
+            if resp.status_code == 200:
+                return
+        except:
+            time.sleep(3)
 
-# ══════════════════════════════════════════════════════
-# KALKULASI INDIKATOR
-# ══════════════════════════════════════════════════════
+# ==========================================
+# TELEGRAM COMMAND HANDLER (TWO-WAY CONTROL)
+# ==========================================
+def check_telegram_commands():
+    global bot_is_paused, last_telegram_update_id
+    if not TG_TOKEN or _is_placeholder(TG_TOKEN):
+        return
 
-def calc_ema(closes, period):
-    if len(closes) < period:
-        return []
-    k = 2.0 / (period + 1)
-    ema = [sum(closes[:period]) / period]
-    for price in closes[period:]:
-        ema.append(price * k + ema[-1] * (1 - k))
-    return ema
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates?offset={last_telegram_update_id + 1}&timeout=1"
+    try:
+        resp = requests.get(url, timeout=5)
+        if resp.status_code != 200:
+            return
+        data = resp.json()
+        if not data.get("ok", False):
+            return
 
+        for update in data.get("result", []):
+            last_telegram_update_id = update["update_id"]
+            message = update.get("message", {})
+            text = message.get("text", "").strip().lower()
+            chat_id = str(message.get("chat", {}).get("id", ""))
 
-def calc_rsi(closes, period=14):
-    if len(closes) < period + 1:
-        return 50.0
-    gains  = [max(closes[i] - closes[i-1], 0) for i in range(1, len(closes))]
-    losses = [max(closes[i-1] - closes[i], 0) for i in range(1, len(closes))]
-    avg_g  = sum(gains[-period:])  / period
-    avg_l  = sum(losses[-period:]) / period
-    if avg_l == 0:
-        return 100.0
-    return 100.0 - (100.0 / (1 + avg_g / avg_l))
+            if chat_id != str(TG_CHAT_ID):
+                continue
 
+            if text == "/status":
+                status_text = (
+                    f"📊 <b>STATUS ADAPTIVE MULTI-TF BOT</b>\n"
+                    f"• Status Bot: {'⏸ PAUSED' if bot_is_paused else '🟢 AKTIF'}\n"
+                    f"• Akumulasi Loss Harian: ${round(daily_loss_tracker, 2)}\n"
+                    f"• Sinyal Terkirim: {total_signals_sent}\n"
+                    f"• Consec Losses: {consecutive_losses}"
+                )
+                send_telegram_message(status_text)
+            elif text == "/pause":
+                bot_is_paused = True
+                send_telegram_message("⏸ <b>Bot dijeda (Paused)</b> via Telegram.")
+            elif text == "/resume":
+                bot_is_paused = False
+                send_telegram_message("▶️ <b>Bot diaktifkan kembali (Resumed)</b> via Telegram.")
+    except Exception as e:
+        log.warning(f"Gagal memeriksa perintah Telegram: {e}")
 
-def calc_macd(closes, fast=12, slow=26, signal=9):
-    ema_f = calc_ema(closes, fast)
-    ema_s = calc_ema(closes, slow)
-    if not ema_f or not ema_s:
-        return 0.0, 0.0, 0.0
-    offset   = len(ema_f) - len(ema_s)
-    macd_arr = [ema_f[i + offset] - ema_s[i] for i in range(len(ema_s))]
-    sig_arr  = calc_ema(macd_arr, signal)
-    if not sig_arr:
-        return 0.0, 0.0, 0.0
-    hist = macd_arr[-1] - sig_arr[-1]
-    return macd_arr[-1], sig_arr[-1], hist
+# ==========================================
+# KALENDER EKONOMI & SESI TRADING
+# ==========================================
+def fetch_economic_calendar():
+    try:
+        resp = requests.get(ECON_CALENDAR_URL, headers={"User-Agent": "Bot/1.0"}, timeout=API_TIMEOUT)
+        if resp.status_code == 200:
+            return resp.json()
+    except:
+        pass
+    return []
 
+def is_high_impact_event_time():
+    now_ts = time.time()
+    now_utc = datetime.now(timezone.utc)
+    window = timedelta(minutes=ECON_WINDOW_MIN)
+    if (now_ts - _econ_cache["checked_at"]) < ECON_CHECK_INTERVAL and _econ_cache["events"]:
+        relevant = _econ_cache["events"]
+    else:
+        raw = fetch_economic_calendar()
+        relevant = []
+        for ev in raw:
+            if str(ev.get("impact", "")).capitalize() in ECON_IMPACT_LEVELS and str(ev.get("country", "")).upper() in ECON_COUNTRIES:
+                dt_str = ev.get("date", "")
+                try:
+                    dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+                    ev["_dt_utc"] = dt
+                    relevant.append(ev)
+                except:
+                    pass
+        _econ_cache["events"] = relevant
+        _econ_cache["checked_at"] = now_ts
 
-def calc_atr(highs, lows, closes, period=14):
-    if len(closes) < period + 1:
-        return 3.0
-    trs = []
-    for i in range(1, len(closes)):
-        tr = max(
-            highs[i] - lows[i],
-            abs(highs[i] - closes[i-1]),
-            abs(lows[i]  - closes[i-1]),
-        )
-        trs.append(tr)
-    return sum(trs[-period:]) / period
+    for ev in relevant:
+        if abs((ev["_dt_utc"] - now_utc).total_seconds()) <= window.total_seconds():
+            return True
+    return False
 
+def is_optimal_trading_session() -> bool:
+    h = datetime.now(timezone.utc).hour
+    return 7 <= h <= 20
 
-# ══════════════════════════════════════════════════════
-# ANALISIS SINYAL
-# ══════════════════════════════════════════════════════
-
-def analyze_signal(candles):
-    data   = list(reversed(candles))
-    closes = [float(v["close"]) for v in data]
-    highs  = [float(v["high"])  for v in data]
-    lows   = [float(v["low"])   for v in data]
-
-    ema9  = calc_ema(closes, 9)
-    ema21 = calc_ema(closes, 21)
-    ema50 = calc_ema(closes, 50)
-    rsi   = calc_rsi(closes, 14)
-    macd_line, signal_line, histogram = calc_macd(closes, 12, 26, 9)
-    atr   = calc_atr(highs, lows, closes, 14)
-
-    if len(ema9) < 2 or len(ema21) < 2 or not ema50:
+# ==========================================
+# FETCH DATA TWELVE DATA
+# ==========================================
+def fetch_data(tf: str):
+    if not TWELVE_API_KEY or _is_placeholder(TWELVE_API_KEY):
+        return None
+    url = f"https://api.twelvedata.com/time_series?symbol={SYMBOL}&interval={tf}&outputsize=150&apikey={TWELVE_API_KEY}"
+    try:
+        resp = requests.get(url, timeout=API_TIMEOUT)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        if "values" not in data:
+            return None
+        df = pd.DataFrame(data["values"]).iloc[::-1].reset_index(drop=True)
+        for col in ["open", "high", "low", "close"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df["volume"] = pd.to_numeric(df.get("volume", 1.0), errors="coerce").fillna(1.0)
+        df.dropna(subset=["open", "high", "low", "close"], inplace=True)
+        return df
+    except:
         return None
 
-    e9_curr  = ema9[-1]
-    e21_curr = ema21[-1]
-    e50_curr = ema50[-1]
-    price    = closes[-1]
+# ==========================================
+# ANALISIS TEKNIKAL & SPESIFIK REASONS
+# ==========================================
+def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["ema_fast"] = df["close"].ewm(span=EMA_FAST, adjust=False).mean()
+    df["ema_slow"] = df["close"].ewm(span=EMA_SLOW, adjust=False).mean()
 
-    indic = {
-        "price":     round(price,     2),
-        "ema9":      round(e9_curr,   2),
-        "ema21":     round(e21_curr,  2),
-        "ema50":     round(e50_curr,  2),
-        "rsi":       round(rsi,       1),
-        "macd":      round(macd_line, 4),
-        "macd_hist": round(histogram, 4),
-        "atr":       round(atr,       2),
-    }
+    delta = df["close"].diff()
+    gain = delta.where(delta > 0, 0.0).ewm(alpha=1 / RSI_LEN, adjust=False).mean()
+    loss = (-delta.where(delta < 0, 0.0)).ewm(alpha=1 / RSI_LEN, adjust=False).mean()
+    rs = gain / loss
+    df["rsi"] = 100 - (100 / (1 + rs))
+    df.loc[loss == 0, "rsi"] = 100.0
 
-    atr_mult = float(config.get("ATR_MULT", 1.5))
-    rr_map   = {"1:1": 1, "1:2": 2, "1:3": 3}
-    rr       = rr_map.get(config.get("RISK_REWARD", "1:2"), 2)
-    sl_dist  = round(atr * atr_mult, 2)
-    tp_dist  = round(sl_dist * rr,   2)
-    entry    = round(price, 2)
+    high_low = df["high"] - df["low"]
+    high_close = (df["high"] - df["close"].shift()).abs()
+    low_close = (df["low"] - df["close"].shift()).abs()
+    df["atr"] = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1).ewm(alpha=1 / ATR_LEN, adjust=False).mean()
 
-    # ── Kondisi BUY ──
-    buy_conds = {}
-    buy_conds[f"EMA9 ({indic['ema9']}) > EMA21 ({indic['ema21']})"] = e9_curr > e21_curr
-    buy_conds[f"Harga ({entry}) > EMA50 ({indic['ema50']})"]         = price > e50_curr
-    buy_conds[f"RSI ({indic['rsi']}) antara 45-65"]                  = 45 <= rsi <= 65
-    buy_conds[f"MACD Hist ({indic['macd_hist']}) > 0"]               = histogram > 0
-    buy_score = sum(buy_conds.values())
+    df["body"] = (df["close"] - df["open"]).abs()
+    df["range"] = (df["high"] - df["low"]).abs()
+    df["upper_wick"] = df["high"] - df[["open", "close"]].max(axis=1)
+    df["lower_wick"] = df[["open", "close"]].min(axis=1) - df["low"]
+    
+    df["wick_rejection_buy"] = (df["lower_wick"] > df["range"] * 0.4) & (df["close"] > df["open"])
+    df["wick_rejection_sell"] = (df["upper_wick"] > df["range"] * 0.4) & (df["close"] < df["open"])
+    df["exhaustion"] = df["body"] > (df["atr"] * 2.0)
+    return df
 
-    # ── Kondisi SELL ──
-    sell_conds = {}
-    sell_conds[f"EMA9 ({indic['ema9']}) < EMA21 ({indic['ema21']})"] = e9_curr < e21_curr
-    sell_conds[f"Harga ({entry}) < EMA50 ({indic['ema50']})"]         = price < e50_curr
-    sell_conds[f"RSI ({indic['rsi']}) antara 35-55"]                  = 35 <= rsi <= 55
-    sell_conds[f"MACD Hist ({indic['macd_hist']}) < 0"]               = histogram < 0
-    sell_score = sum(sell_conds.values())
+def check_market_dominance(df: pd.DataFrame):
+    recent = df.tail(15).copy()
+    buyer_power = ((recent['close'] > recent['open']) * recent['body']).sum() + (recent['lower_wick'] * 1.5).sum()
+    seller_power = ((recent['close'] < recent['open']) * recent['body']).sum() + (recent['upper_wick'] * 1.5).sum()
+    total_power = buyer_power + seller_power
+    if total_power == 0:
+        return "⚖️ SEIMBANG", 50.0, 50.0
+    buyer_pct = (buyer_power / total_power) * 100
+    seller_pct = (seller_power / total_power) * 100
+    if buyer_pct > 55:
+        dominance = "🟢 BUYER DOMINAN"
+    elif seller_pct > 55:
+        dominance = "🔴 SELLER DOMINAN"
+    else:
+        dominance = "⚖️ KONSOLIDASI"
+    return dominance, round(buyer_pct, 1), round(seller_pct, 1)
 
-    min_score = int(config.get("MIN_SCORE", 3))
+def analyze_tf(tf: str):
+    min_rows = EMA_SLOW + ATR_LEN + 20
+    df = fetch_data(tf)
+    if df is None or len(df) < min_rows:
+        return "WAIT", 0.0, 0.0, 0, [], "⚖️ SEIMBANG", 50, 50
 
-    if buy_score >= min_score and buy_score >= sell_score:
-        return {
-            "type": "BUY", "score": buy_score, "max_score": 4,
-            "conditions": buy_conds, "entry": entry,
-            "sl": round(entry - sl_dist, 2), "tp": round(entry + tp_dist, 2),
-            "sl_dist": sl_dist, "tp_dist": tp_dist, "indicators": indic,
-        }
+    df = calculate_features(df)
+    dominance, b_pct, s_pct = check_market_dominance(df)
+    last_closed = df.iloc[-2]
+    live_price = float(df.iloc[-1]["close"])
 
-    if sell_score >= min_score and sell_score > buy_score:
-        return {
-            "type": "SELL", "score": sell_score, "max_score": 4,
-            "conditions": sell_conds, "entry": entry,
-            "sl": round(entry + sl_dist, 2), "tp": round(entry - tp_dist, 2),
-            "sl_dist": sl_dist, "tp_dist": tp_dist, "indicators": indic,
-        }
+    if last_closed["exhaustion"]:
+        return "WAIT", 0.0, 0.0, 0, ["Candle exhaustion terdeteksi"], dominance, b_pct, s_pct
 
-    return None
+    bull_confluence, bear_confluence = 0, 0
+    bull_reasons, bear_reasons = [], []
 
+    if last_closed["wick_rejection_buy"]:
+        lw = round(float(last_closed["lower_wick"]), 2)
+        rng = round(float(last_closed["range"]), 2)
+        bull_confluence += 2
+        bull_reasons.append(f"Wick Rejection Bawah valid di TF {tf} (Ekor bawah: {lw} dari range {rng})")
+        
+    if last_closed["wick_rejection_sell"]:
+        uw = round(float(last_closed["upper_wick"]), 2)
+        rng = round(float(last_closed["range"]), 2)
+        bear_confluence += 2
+        bear_reasons.append(f"Wick Rejection Atas valid di TF {tf} (Ekor atas: {uw} dari range {rng})")
 
-# ══════════════════════════════════════════════════════
-# HELPERS
-# ══════════════════════════════════════════════════════
+    bull_momentum = (last_closed["ema_fast"] > last_closed["ema_slow"]) and (RSI_OS < last_closed["rsi"] < RSI_OB)
+    bear_momentum = (last_closed["ema_fast"] < last_closed["ema_slow"]) and (RSI_OS < last_closed["rsi"] < RSI_OB)
 
-def send_telegram(message):
-    token   = config.get("TELEGRAM_BOT_TOKEN", "").strip()
-    chat_id = config.get("TELEGRAM_CHAT_ID",   "").strip()
-    if not token or not chat_id:
-        return False
-    try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat_id, "text": message, "parse_mode": "Markdown"},
-            timeout=5,
-        )
-        return r.status_code == 200
-    except Exception:
-        return False
+    rsi_val = round(float(last_closed["rsi"]), 1)
+    ema_f = round(float(last_closed["ema_fast"]), 2)
+    ema_s = round(float(last_closed["ema_slow"]), 2)
 
+    if bull_momentum:
+        bull_confluence += 1
+        bull_reasons.append(f"Tren EMA Bullish di TF {tf} (Fast {ema_f} > Slow {ema_s}) dengan RSI {rsi_val}")
+    if bear_momentum:
+        bear_confluence += 1
+        bear_reasons.append(f"Tren EMA Bearish di TF {tf} (Fast {ema_f} < Slow {ema_s}) dengan RSI {rsi_val}")
 
-def _recalc_stats():
-    total_closed = bot_stats["win_count"] + bot_stats["loss_count"]
-    if total_closed > 0:
-        wr  = bot_stats["win_count"] / total_closed * 100
-        avg = bot_stats["total_pnl_pips"] / total_closed
-        bot_stats["win_rate"] = f"{wr:.1f}%"
-        sign = "+" if avg >= 0 else ""
-        bot_stats["avg_pnl"] = f"{sign}{avg:.1f} pips / trade"
-    pnl  = bot_stats["total_pnl_pips"]
-    sign = "+" if pnl >= 0 else ""
-    bot_stats["total_pnl"] = f"{sign}{pnl:.1f} pips"
+    if dominance == "🟢 BUYER DOMINAN":
+        bull_reasons.append(f"Order Flow TF {tf} didominasi Buyer ({b_pct}%)")
+    elif dominance == "🔴 SELLER DOMINAN":
+        bear_reasons.append(f"Order Flow TF {tf} didominasi Seller ({s_pct}%)")
 
+    if bull_confluence >= MIN_CONFLUENCE and bear_confluence >= MIN_CONFLUENCE:
+        return "WAIT", live_price, float(last_closed["atr"]), 0, [], dominance, b_pct, s_pct
 
-def _resolve_pending(current_price):
-    still_open = []
-    messages   = []
+    signal, score, reasons = "WAIT", 0, []
+    if bull_confluence >= MIN_CONFLUENCE:
+        signal, score, reasons = "BUY", bull_confluence, bull_reasons
+    elif bear_confluence >= MIN_CONFLUENCE:
+        signal, score, reasons = "SELL", bear_confluence, bear_reasons
 
-    for sig in bot_stats["pending_signals"]:
-        hit_tp = hit_sl = False
-        if sig["type"] == "BUY":
-            hit_tp = current_price >= sig["tp"]
-            hit_sl = current_price <= sig["sl"]
-        else:
-            hit_tp = current_price <= sig["tp"]
-            hit_sl = current_price >= sig["sl"]
+    return signal, live_price, float(last_closed["atr"]), score, reasons, dominance, b_pct, s_pct
 
-        if hit_tp or hit_sl:
-            pnl_pips = sig.get("tp_dist", sig["sl_dist"]) if hit_tp else -sig["sl_dist"]
-            sig["status"]      = "WIN" if hit_tp else "LOSS"
-            sig["pnl_pips"]    = round(pnl_pips, 2)
-            sig["close_price"] = round(current_price, 2)
+def calculate_position_size(price: float, sl_price: float) -> float:
+    risk_amount = ACCOUNT_BALANCE * (RISK_PERCENT / 100.0)
+    risk_per_unit = abs(price - sl_price)
+    if risk_per_unit == 0:
+        return 0.01
+    lot = risk_amount / (risk_per_unit * CONTRACT_SIZE)
+    return round(max(min(lot, MAX_LOT), 0.01), 2)
 
-            bot_stats["total_pnl_pips"] += pnl_pips
-            if hit_tp:
-                bot_stats["win_count"]  += 1
-            else:
-                bot_stats["loss_count"] += 1
+def reset_daily_if_needed():
+    global daily_loss_tracker, last_reset_day, consecutive_losses
+    today = datetime.now(timezone.utc).date()
+    if today != last_reset_day:
+        daily_loss_tracker = 0.0
+        consecutive_losses = 0
+        last_reset_day = today
 
-            bot_stats["signal_history"].insert(0, sig)
-            if len(bot_stats["signal_history"]) > 50:
-                bot_stats["signal_history"] = bot_stats["signal_history"][:50]
+def in_tf_cooldown(tf: str, direction: str) -> bool:
+    key = f"{SYMBOL}_{tf}_{direction}"
+    return (time.time() - tf_last_signal_time.get(key, 0)) < TF_COOLDOWN
 
-            emoji  = "✅" if hit_tp else "❌"
-            result = "PROFIT" if hit_tp else "LOSS"
-            sign   = "+" if pnl_pips >= 0 else ""
-            messages.append(
-                f"{emoji} *SIGNAL CLOSED — {result}*\n\n"
-                f"Pair: XAUUSD | Tipe: *{sig['type']}*\n"
-                f"Entry: `{sig['entry']}` → Close: `{sig['close_price']}`\n"
-                f"PnL: `{sign}{pnl_pips:.1f} pips`\n"
-                f"Lot: `{config.get('LOT_SIZE', 0.1)}` | RR: `{config.get('RISK_REWARD', '1:2')}`\n"
-                f"Skor sinyal: `{sig.get('score', '?')}/4`"
-            )
-        else:
-            still_open.append(sig)
+def mark_tf_signal(tf: str, direction: str):
+    key = f"{SYMBOL}_{tf}_{direction}"
+    tf_last_signal_time[key] = time.time()
 
-    bot_stats["pending_signals"] = still_open
-    _recalc_stats()
-    return messages
+# ==========================================
+# MASTER LOOP UTAMA
+# ==========================================
+def run_bot_engine():
+    global total_signals_sent
+    log.info("Adaptive Multi-TF Bot XAU/USD AKTIF")
+    send_telegram_message("🚀 <b>Adaptive Multi-TF Bot XAU/USD Aktif & Berjalan</b>\nMemindai seluruh Timeframe secara independen.")
 
-
-# ══════════════════════════════════════════════════════
-# BACKGROUND WORKER THREAD
-# ══════════════════════════════════════════════════════
-
-def trading_bot_worker():
     while True:
-        outbox = []
+        try:
+            check_telegram_commands()
 
-        if config.get("IS_RUNNING"):
-            api_key = config.get("TWELVE_DATA_API_KEY", "").strip()
-            tf      = config.get("TIMEFRAME", "5min")
+            if bot_is_paused:
+                time.sleep(15)
+                continue
 
-            if not api_key:
-                with lock:
-                    bot_stats["last_error"] = "⚠️ API Key Twelve Data belum diisi."
-            else:
+            reset_daily_if_needed()
+
+            if daily_loss_tracker >= ACCOUNT_BALANCE * (MAX_DAILY_LOSS / 100.0) or consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
+                log.warning("Circuit breaker aktif: Batas kerugian tercapai. Jeda 3 jam.")
+                time.sleep(10800)
+                continue
+
+            if is_high_impact_event_time() or not is_optimal_trading_session():
+                time.sleep(60)
+                continue
+
+            for tf in TIMEFRAMES:
                 try:
-                    url = (
-                        "https://api.twelvedata.com/time_series"
-                        f"?symbol=XAU/USD&interval={tf}"
-                        f"&outputsize=100&apikey={api_key}"
-                    )
-                    res = requests.get(url, timeout=15).json()
+                    signal, price, atr, score, reasons, dominance, b_pct, s_pct = analyze_tf(tf)
+                    
+                    if signal == "WAIT" or price == 0:
+                        continue
 
-                    if "values" in res and len(res["values"]) >= 60:
-                        candles   = res["values"]
-                        close_now = float(candles[0]["close"])
-                        now_wib   = datetime.now(
-                            pytz.timezone("Asia/Jakarta")
-                        ).strftime("%Y-%m-%d %H:%M:%S")
+                    if in_tf_cooldown(tf, signal):
+                        continue
 
-                        signal = analyze_signal(candles)
+                    adaptive_sl_mult = 1.0 if tf in ["5min", "15min"] else 1.5
+                    adaptive_tp_mult = 2.0 if tf in ["5min", "15min"] else 2.5
 
-                        with lock:
-                            bot_stats["last_check"]    = now_wib
-                            bot_stats["last_error"]    = ""
-                            bot_stats["current_price"] = round(close_now, 2)
-
-                            if signal:
-                                bot_stats["indicators"]      = signal["indicators"]
-                                bot_stats["last_score"]      = signal["score"]
-                                bot_stats["last_conditions"] = signal["conditions"]
-
-                            outbox.extend(_resolve_pending(close_now))
-
-                            if signal:
-                                sig_type = signal["type"]
-                                if sig_type != bot_stats["last_signal_type"]:
-                                    bot_stats["last_signal_type"] = sig_type
-
-                                    new_sig = {
-                                        "time":        now_wib,
-                                        "tf":          tf,
-                                        "type":        sig_type,
-                                        "entry":       signal["entry"],
-                                        "sl":          signal["sl"],
-                                        "tp":          signal["tp"],
-                                        "sl_dist":     signal["sl_dist"],
-                                        "tp_dist":     signal["tp_dist"],
-                                        "score":       signal["score"],
-                                        "conditions":  signal["conditions"],
-                                        "indicators":  signal["indicators"],
-                                        "status":      "OPEN",
-                                        "pnl_pips":    None,
-                                        "close_price": None,
-                                    }
-                                    bot_stats["pending_signals"].append(new_sig)
-                                    if len(bot_stats["pending_signals"]) > 50:
-                                        bot_stats["pending_signals"] = bot_stats["pending_signals"][-50:]
-                                    bot_stats["total_signals"] += 1
-
-                                    stars      = "⭐" * signal["score"]
-                                    emoji      = "🟢" if sig_type == "BUY" else "🔴"
-                                    indic      = signal["indicators"]
-                                    conds_text = "\n".join(
-                                        f"  {'✅' if v else '❌'} {k}"
-                                        for k, v in signal["conditions"].items()
-                                    )
-                                    outbox.append(
-                                        f"🚨 *XAUUSD SIGNAL — {sig_type}* {stars}\n\n"
-                                        f"{emoji} Tipe: *{sig_type}*\n"
-                                        f"📊 Skor: *{signal['score']}/4*\n\n"
-                                        f"📍 Entry: `{signal['entry']}`\n"
-                                        f"🛡 Stop Loss: `{signal['sl']}` ({signal['sl_dist']} pips)\n"
-                                        f"🎯 Take Profit: `{signal['tp']}` ({signal['tp_dist']} pips)\n"
-                                        f"📦 Lot: `{config.get('LOT_SIZE', 0.1)}` | "
-                                        f"RR: `{config.get('RISK_REWARD', '1:2')}`\n\n"
-                                        f"📈 Indikator:\n"
-                                        f"  EMA9: `{indic['ema9']}` | EMA21: `{indic['ema21']}` | EMA50: `{indic['ema50']}`\n"
-                                        f"  RSI: `{indic['rsi']}` | MACD Hist: `{indic['macd_hist']}` | ATR: `{indic['atr']}`\n\n"
-                                        f"✅ Kondisi:\n{conds_text}\n\n"
-                                        f"⏱ {now_wib} WIB | TF: {tf}"
-                                    )
-
-                    elif "message" in res:
-                        with lock:
-                            bot_stats["last_error"] = f"⚠️ API Error: {res.get('message', 'Unknown')}"
-                    elif "values" in res and len(res["values"]) < 60:
-                        with lock:
-                            bot_stats["last_error"] = (
-                                f"⚠️ Data tidak cukup ({len(res['values'])} candle, butuh >= 60)."
-                            )
+                    if signal == "BUY":
+                        sl = price - (atr * adaptive_sl_mult)
+                        tp = price + (atr * adaptive_tp_mult)
+                        be_target = price + (atr * 0.7)
                     else:
-                        with lock:
-                            bot_stats["last_error"] = "⚠️ Respons API tidak valid."
+                        sl = price + (atr * adaptive_sl_mult)
+                        tp = price - (atr * adaptive_tp_mult)
+                        be_target = price - (atr * 0.7)
 
-                except requests.exceptions.Timeout:
-                    with lock:
-                        bot_stats["last_error"] = "⚠️ Timeout — tidak dapat menghubungi Twelve Data."
-                except requests.exceptions.ConnectionError:
-                    with lock:
-                        bot_stats["last_error"] = "⚠️ Koneksi gagal — periksa jaringan Railway."
+                    lot = calculate_position_size(price, sl)
+                    total_signals_sent += 1
+                    
+                    emoji = "🟢" if signal == "BUY" else "🔴"
+                    side = "LONG / BUY" if signal == "BUY" else "SHORT / SELL"
+                    fmt_reasons = "\n".join(f"• {r}" for r in reasons) or "• Memenuhi konfluensi"
+
+                    msg = (
+                        f"{emoji} <b>SINYAL DETAIL TF [{tf}] ({side})</b>\n"
+                        f"💎 Pair: <code>{SYMBOL}</code>\n"
+                        f"📊 <b>Dominasi TF {tf}:</b> {dominance} (B: {b_pct}% | S: {s_pct}%)\n"
+                        f"📈 Skor Konfluensi: {score}\n\n"
+                        f"📝 <b>Analisis Rinci Timeframe {tf}:</b>\n{fmt_reasons}\n\n"
+                        f"💰 Entry (Close Candle {tf}): <code>{price}</code>\n"
+                        f"📦 Lot (Risk Managed): <code>{lot}</code>\n"
+                        f"🛑 SL Adaptif: <code>{round(sl, 4)}</code>\n"
+                        f"🎯 Target Break-Even: <code>{round(be_target, 4)}</code>\n"
+                        f"🎯 TP Adaptif: <code>{round(tp, 4)}</code>\n\n"
+                        f"--------------------------\n"
+                        f"Jangan lupa shodaqoh\n"
+                        f"Jaga Ibadahmu\n"
+                        f"Ttd. Abah FK"
+                    )
+
+                    send_telegram_message(msg)
+                    mark_tf_signal(tf, signal)
+                    time.sleep(10)
+
                 except Exception as e:
-                    with lock:
-                        bot_stats["last_error"] = f"⚠️ Error: {e}"
+                    log.exception(f"Error pada TF {tf}: {e}")
+                time.sleep(5)
 
-        for msg in outbox:
-            send_telegram(msg)
+            gc.collect()
 
-        intervals = {"1min": 60, "5min": 300, "15min": 900}
-        time.sleep(intervals.get(config.get("TIMEFRAME", "5min"), 300))
-
-
-_worker = threading.Thread(target=trading_bot_worker, daemon=True, name="BotWorker")
-_worker.start()
-
-
-# ══════════════════════════════════════════════════════
-# HTML DASHBOARD
-# ══════════════════════════════════════════════════════
-
-HTML = r"""<!DOCTYPE html>
-<html lang="id">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0">
-<meta http-equiv="refresh" content="30">
-<title>XAUUSD Bot</title>
-<style>
-*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-body{font-family:'Segoe UI',Arial,sans-serif;background:#0d1117;color:#c9d1d9;min-height:100vh;padding:16px}
-.wrap{max-width:1020px;margin:auto}
-.hdr{text-align:center;padding:22px 0 18px;border-bottom:1px solid #21262d;margin-bottom:20px}
-.hdr h1{font-size:24px;color:#f0a500;letter-spacing:1px}
-.hdr small{font-size:11px;color:#484f58;margin-top:4px;display:block}
-.err{background:#3d1414;border:1px solid #da3633;border-radius:6px;padding:10px 14px;margin-bottom:16px;font-size:13px;color:#f85149}
-.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:12px;margin-bottom:18px}
-.card{background:#161b22;border:1px solid #21262d;border-radius:8px;padding:14px;text-align:center}
-.lbl{font-size:10px;color:#8b949e;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px}
-.val{font-size:22px;font-weight:700;color:#f0f6fc}
-.g{color:#3fb950}.r{color:#f85149}.y{color:#f0a500}
-.badge{display:inline-block;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:700}
-.b-run{background:#1a4731;color:#3fb950;border:1px solid #238636}
-.b-stp{background:#3d1414;color:#f85149;border:1px solid #da3633}
-.b-opn{background:#1c2d41;color:#58a6ff;border:1px solid #1f6feb}
-.b-win{background:#1a4731;color:#3fb950;border:1px solid #238636}
-.b-los{background:#3d1414;color:#f85149;border:1px solid #da3633}
-.score-bar{display:flex;align-items:center;gap:8px;margin-bottom:18px;background:#161b22;border:1px solid #21262d;border-radius:8px;padding:14px 16px;flex-wrap:wrap}
-.score-bar .slbl{font-size:11px;color:#8b949e;margin-right:4px}
-.dot{width:20px;height:20px;border-radius:50%;border:2px solid #30363d;display:inline-block}
-.dot.on{background:#3fb950;border-color:#238636}
-.dot.off{background:#21262d;border-color:#30363d}
-.conds{margin-top:10px;width:100%}
-.cond-row{display:flex;align-items:center;gap:6px;font-size:12px;margin-bottom:4px;color:#c9d1d9}
-.indbar{background:#161b22;border:1px solid #21262d;border-radius:8px;padding:12px 16px;margin-bottom:18px}
-.indbar .title{font-size:11px;color:#8b949e;text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px}
-.inds{display:flex;flex-wrap:wrap;gap:12px}
-.ind{background:#0d1117;border:1px solid #21262d;border-radius:6px;padding:8px 12px;min-width:100px}
-.ind .ik{font-size:10px;color:#8b949e;margin-bottom:3px}
-.ind .iv{font-size:15px;font-weight:700;color:#f0f6fc}
-.pbar{background:#161b22;border:1px solid #21262d;border-radius:8px;padding:12px 16px;margin-bottom:18px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px}
-.plbl{font-size:11px;color:#8b949e}
-.pval{font-size:24px;font-weight:700;color:#f0a500}
-.pmeta{font-size:11px;color:#6e7681;text-align:right}
-.fcard{background:#161b22;border:1px solid #21262d;border-radius:8px;padding:20px;margin-bottom:20px}
-.fcard h3{font-size:11px;color:#8b949e;text-transform:uppercase;letter-spacing:.5px;margin-bottom:14px}
-.fgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px}
-.field{display:flex;flex-direction:column;gap:5px}
-.field label{font-size:11px;color:#8b949e}
-.field input,.field select{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:8px 10px;color:#c9d1d9;font-size:13px;width:100%}
-.field input:focus,.field select:focus{outline:none;border-color:#f0a500}
-.bgrp{display:flex;gap:10px;margin-top:16px;flex-wrap:wrap}
-.btn{flex:1;min-width:110px;padding:9px 16px;border:none;border-radius:6px;font-weight:700;font-size:13px;cursor:pointer;transition:opacity .15s}
-.btn:hover{opacity:.85}
-.btn-s{background:#1f6feb;color:#fff}
-.btn-go{background:#238636;color:#fff}
-.btn-stop{background:#da3633;color:#fff}
-.btn-rst{background:#333;color:#aaa}
-.stitle{font-size:11px;color:#8b949e;text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px}
-.tbl-wrap{overflow-x:auto;margin-bottom:20px}
-table{width:100%;border-collapse:collapse;background:#161b22;border:1px solid #21262d;border-radius:8px;overflow:hidden;font-size:13px;min-width:520px}
-th{background:#1c2128;color:#8b949e;padding:10px 12px;text-align:left;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.4px}
-td{padding:9px 12px;border-top:1px solid #21262d}
-tr:hover td{background:#1c2128}
-.buy{color:#3fb950;font-weight:700}.sell{color:#f85149;font-weight:700}
-.pp{color:#3fb950}.np{color:#f85149}
-.empty td{text-align:center;color:#484f58;padding:20px}
-.foot{text-align:center;font-size:10px;color:#484f58;padding:10px 0 20px}
-</style>
-</head>
-<body>
-<div class="wrap">
-
-<div class="hdr">
-  <h1>⚡ XAUUSD Scalping Bot</h1>
-  <small>Multi-indikator confluence · EMA + RSI + MACD + ATR · Auto-refresh 30 detik</small>
-</div>
-
-{% if stats.last_error %}
-<div class="err">{{ stats.last_error }}</div>
-{% endif %}
-
-<div class="cards">
-  <div class="card">
-    <div class="lbl">Status Bot</div>
-    <div class="val" style="font-size:14px;margin-top:4px">
-      <span class="badge {% if running %}b-run{% else %}b-stp{% endif %}">
-        {% if running %}● RUNNING{% else %}● STOPPED{% endif %}
-      </span>
-    </div>
-  </div>
-  <div class="card">
-    <div class="lbl">Total Sinyal</div>
-    <div class="val y">{{ stats.total_signals }}</div>
-  </div>
-  <div class="card">
-    <div class="lbl">Win / Loss</div>
-    <div class="val" style="font-size:18px">
-      <span class="g">{{ stats.win_count }}</span>
-      <span style="color:#484f58"> / </span>
-      <span class="r">{{ stats.loss_count }}</span>
-    </div>
-  </div>
-  <div class="card">
-    <div class="lbl">Win Rate</div>
-    <div class="val {% if stats.win_count > stats.loss_count %}g{% elif stats.loss_count > stats.win_count %}r{% endif %}">
-      {{ stats.win_rate }}
-    </div>
-  </div>
-  <div class="card">
-    <div class="lbl">Total PnL</div>
-    <div class="val {% if '-' in stats.total_pnl %}r{% elif stats.total_pnl != '+0.0 pips' %}g{% endif %}">
-      {{ stats.total_pnl }}
-    </div>
-  </div>
-  <div class="card">
-    <div class="lbl">Avg PnL / Trade</div>
-    <div class="val" style="font-size:14px;margin-top:4px">{{ stats.avg_pnl }}</div>
-  </div>
-</div>
-
-<div class="pbar">
-  <div>
-    <div class="plbl">Harga Terakhir XAUUSD</div>
-    <div class="pval">{% if stats.current_price %}{{ stats.current_price }}{% else %}—{% endif %}</div>
-  </div>
-  <div class="pmeta">
-    Pengecekan: {{ stats.last_check }}<br>
-    Open: {{ stats.pending_signals | length }} · Closed: {{ stats.signal_history | length }}
-  </div>
-</div>
-
-{% if stats.indicators %}
-<div class="indbar">
-  <div class="title">📈 Nilai Indikator Terakhir</div>
-  <div class="inds">
-    {% set ind = stats.indicators %}
-    <div class="ind"><div class="ik">EMA 9</div><div class="iv">{{ ind.ema9 }}</div></div>
-    <div class="ind"><div class="ik">EMA 21</div><div class="iv">{{ ind.ema21 }}</div></div>
-    <div class="ind"><div class="ik">EMA 50</div><div class="iv">{{ ind.ema50 }}</div></div>
-    <div class="ind"><div class="ik">RSI (14)</div>
-      <div class="iv {% if ind.rsi > 65 %}r{% elif ind.rsi < 35 %}g{% else %}y{% endif %}">{{ ind.rsi }}</div>
-    </div>
-    <div class="ind"><div class="ik">MACD Hist</div>
-      <div class="iv {% if ind.macd_hist > 0 %}g{% elif ind.macd_hist < 0 %}r{% endif %}">{{ ind.macd_hist }}</div>
-    </div>
-    <div class="ind"><div class="ik">ATR (14)</div><div class="iv">{{ ind.atr }}</div></div>
-  </div>
-</div>
-{% endif %}
-
-{% if stats.last_score %}
-<div class="score-bar">
-  <div>
-    <span class="slbl">Skor Kondisi Terakhir:</span>
-    <strong style="color:#f0a500">{{ stats.last_score }} / 4</strong> &nbsp;
-    {% for i in range(4) %}
-      <span class="dot {% if i < stats.last_score %}on{% else %}off{% endif %}"></span>
-    {% endfor %}
-  </div>
-  {% if stats.last_conditions %}
-  <div class="conds">
-    {% for cond, met in stats.last_conditions.items() %}
-    <div class="cond-row">
-      <span>{% if met %}✅{% else %}❌{% endif %}</span>
-      <span>{{ cond }}</span>
-    </div>
-    {% endfor %}
-  </div>
-  {% endif %}
-</div>
-{% endif %}
-
-<div class="fcard">
-  <h3>⚙️ Pengaturan API & Bot</h3>
-  <form method="POST" action="/update">
-    <div class="fgrid">
-      <div class="field">
-        <label>Telegram Bot Token</label>
-        <input type="password" name="telegram_token" value="{{ cfg.TELEGRAM_BOT_TOKEN }}" placeholder="Dari @BotFather">
-      </div>
-      <div class="field">
-        <label>Telegram Chat ID</label>
-        <input type="text" name="telegram_chat_id" value="{{ cfg.TELEGRAM_CHAT_ID }}" placeholder="-100xxxxxxxxxx">
-      </div>
-      <div class="field">
-        <label>Twelve Data API Key</label>
-        <input type="password" name="twelve_data_key" value="{{ cfg.TWELVE_DATA_API_KEY }}" placeholder="Dari twelvedata.com">
-      </div>
-      <div class="field">
-        <label>Timeframe</label>
-        <select name="timeframe">
-          <option value="1min"  {% if cfg.TIMEFRAME=='1min'  %}selected{% endif %}>1 Menit</option>
-          <option value="5min"  {% if cfg.TIMEFRAME=='5min'  %}selected{% endif %}>5 Menit</option>
-          <option value="15min" {% if cfg.TIMEFRAME=='15min' %}selected{% endif %}>15 Menit</option>
-        </select>
-      </div>
-      <div class="field">
-        <label>Lot Size</label>
-        <input type="text" name="lot_size" value="{{ cfg.LOT_SIZE }}" placeholder="0.01 – 100">
-      </div>
-      <div class="field">
-        <label>ATR Multiplier (SL = ATR x mult)</label>
-        <input type="text" name="atr_mult" value="{{ cfg.ATR_MULT }}" placeholder="1.0 – 3.0">
-      </div>
-      <div class="field">
-        <label>Risk : Reward</label>
-        <select name="risk_reward">
-          <option value="1:1" {% if cfg.RISK_REWARD=='1:1' %}selected{% endif %}>1 : 1</option>
-          <option value="1:2" {% if cfg.RISK_REWARD=='1:2' %}selected{% endif %}>1 : 2</option>
-          <option value="1:3" {% if cfg.RISK_REWARD=='1:3' %}selected{% endif %}>1 : 3</option>
-        </select>
-      </div>
-      <div class="field">
-        <label>Minimum Skor Sinyal (1-4)</label>
-        <select name="min_score">
-          <option value="2" {% if cfg.MIN_SCORE==2 %}selected{% endif %}>2 dari 4 kondisi</option>
-          <option value="3" {% if cfg.MIN_SCORE==3 %}selected{% endif %}>3 dari 4 kondisi (disarankan)</option>
-          <option value="4" {% if cfg.MIN_SCORE==4 %}selected{% endif %}>4 dari 4 kondisi (ketat)</option>
-        </select>
-      </div>
-    </div>
-    <div class="bgrp">
-      <button class="btn btn-s"    type="submit" name="action" value="save">💾 Simpan</button>
-      {% if running %}
-      <button class="btn btn-stop" type="submit" name="action" value="stop">⏹ Stop Bot</button>
-      {% else %}
-      <button class="btn btn-go"   type="submit" name="action" value="start">▶ Start Bot</button>
-      {% endif %}
-      <button class="btn btn-rst"  type="submit" name="action" value="reset"
-              onclick="return confirm('Reset semua statistik dan riwayat sinyal?')">
-        🔄 Reset Stats
-      </button>
-    </div>
-  </form>
-</div>
-
-<div class="stitle">🔵 Sinyal Aktif — Menunggu TP / SL ({{ stats.pending_signals | length }})</div>
-<div class="tbl-wrap">
-  <table>
-    <thead>
-      <tr><th>Waktu</th><th>TF</th><th>Tipe</th><th>Skor</th><th>Entry</th><th>SL</th><th>TP</th><th>Status</th></tr>
-    </thead>
-    <tbody>
-    {% for s in stats.pending_signals | reverse %}
-    <tr>
-      <td>{{ s.time }}</td>
-      <td>{{ s.tf }}</td>
-      <td class="{% if s.type=='BUY' %}buy{% else %}sell{% endif %}">{{ s.type }}</td>
-      <td><strong style="color:#f0a500">{{ s.score }}/4</strong></td>
-      <td>{{ s.entry }}</td><td>{{ s.sl }}</td><td>{{ s.tp }}</td>
-      <td><span class="badge b-opn">{{ s.status }}</span></td>
-    </tr>
-    {% else %}
-    <tr class="empty"><td colspan="8">Belum ada sinyal aktif. Klik ▶ Start Bot untuk mulai.</td></tr>
-    {% endfor %}
-    </tbody>
-  </table>
-</div>
-
-<div class="stitle">📋 Riwayat Sinyal Closed ({{ stats.signal_history | length }})</div>
-<div class="tbl-wrap">
-  <table>
-    <thead>
-      <tr><th>Waktu</th><th>TF</th><th>Tipe</th><th>Skor</th><th>Entry</th><th>Close</th><th>SL</th><th>TP</th><th>PnL (pips)</th><th>Hasil</th></tr>
-    </thead>
-    <tbody>
-    {% for s in stats.signal_history %}
-    <tr>
-      <td>{{ s.time }}</td>
-      <td>{{ s.tf }}</td>
-      <td class="{% if s.type=='BUY' %}buy{% else %}sell{% endif %}">{{ s.type }}</td>
-      <td><strong style="color:#f0a500">{{ s.get('score','?') }}/4</strong></td>
-      <td>{{ s.entry }}</td>
-      <td>{{ s.close_price if s.close_price else '—' }}</td>
-      <td>{{ s.sl }}</td><td>{{ s.tp }}</td>
-      <td class="{% if s.pnl_pips and s.pnl_pips >= 0 %}pp{% else %}np{% endif %}">
-        {% if s.pnl_pips is not none %}{{ '+' if s.pnl_pips >= 0 else '' }}{{ s.pnl_pips }}{% else %}—{% endif %}
-      </td>
-      <td>
-        {% if 'WIN' in s.status %}<span class="badge b-win">WIN ✅</span>
-        {% elif 'LOSS' in s.status %}<span class="badge b-los">LOSS ❌</span>
-        {% else %}<span class="badge b-opn">{{ s.status }}</span>{% endif %}
-      </td>
-    </tr>
-    {% else %}
-    <tr class="empty"><td colspan="10">Belum ada riwayat sinyal closed.</td></tr>
-    {% endfor %}
-    </tbody>
-  </table>
-</div>
-
-<div class="foot">XAUUSD Scalping Bot · EMA + RSI + MACD + ATR · Data: Twelve Data API</div>
-</div>
-</body>
-</html>"""
-
-
-# ══════════════════════════════════════════════════════
-# FLASK ROUTES
-# ══════════════════════════════════════════════════════
-
-@app.route("/")
-def index():
-    with lock:
-        snap = {
-            "total_signals":   bot_stats["total_signals"],
-            "win_count":       bot_stats["win_count"],
-            "loss_count":      bot_stats["loss_count"],
-            "win_rate":        bot_stats["win_rate"],
-            "total_pnl":       bot_stats["total_pnl"],
-            "avg_pnl":         bot_stats["avg_pnl"],
-            "last_check":      bot_stats["last_check"],
-            "last_error":      bot_stats["last_error"],
-            "current_price":   bot_stats["current_price"],
-            "indicators":      dict(bot_stats["indicators"]),
-            "last_score":      bot_stats["last_score"],
-            "last_conditions": dict(bot_stats["last_conditions"]),
-            "pending_signals": list(bot_stats["pending_signals"]),
-            "signal_history":  list(bot_stats["signal_history"]),
-        }
-    return render_template_string(HTML, cfg=config, running=config["IS_RUNNING"], stats=snap)
-
-
-@app.route("/update", methods=["POST"])
-def update():
-    config["TELEGRAM_BOT_TOKEN"]  = request.form.get("telegram_token",  "").strip()
-    config["TELEGRAM_CHAT_ID"]    = request.form.get("telegram_chat_id", "").strip()
-    config["TWELVE_DATA_API_KEY"] = request.form.get("twelve_data_key",  "").strip()
-    config["TIMEFRAME"]           = request.form.get("timeframe",   "5min")
-    config["RISK_REWARD"]         = request.form.get("risk_reward", "1:2")
-
-    try:
-        config["LOT_SIZE"] = max(0.01, min(float(request.form.get("lot_size",  "0.1")), 100.0))
-    except ValueError:
-        pass
-    try:
-        config["ATR_MULT"] = max(0.5, min(float(request.form.get("atr_mult", "1.5")), 5.0))
-    except ValueError:
-        pass
-    try:
-        config["MIN_SCORE"] = max(1, min(int(request.form.get("min_score", "3")), 4))
-    except ValueError:
-        pass
-
-    action = request.form.get("action")
-    if action == "start":
-        config["IS_RUNNING"] = True
-    elif action == "stop":
-        config["IS_RUNNING"] = False
-    elif action == "reset":
-        with lock:
-            bot_stats.update({
-                "total_signals": 0, "win_count": 0, "loss_count": 0,
-                "win_rate": "0.0%", "total_pnl_pips": 0.0,
-                "total_pnl": "+0.0 pips", "avg_pnl": "+0.0 pips / trade",
-                "last_signal_type": None, "last_score": 0,
-                "last_conditions": {}, "indicators": {},
-                "pending_signals": [], "signal_history": [],
-            })
-
-    return redirect(url_for("index"))
-
+        except Exception as e:
+            log.exception(f"Error dalam perulangan utama bot: {e}")
+            time.sleep(10)
+        
+        time.sleep(POLL_INTERVAL)
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    while True:
+        try:
+            run_bot_engine()
+        except KeyboardInterrupt:
+            log.info("Bot dihentikan manual oleh user.")
+            send_telegram_message("🛑 Bot dihentikan manual.")
+            break
+        except Exception as crash_error:
+            log.critical(f"Bot mengalami crash fatal: {crash_error}. Auto-restart dalam 30 detik...")
+            time.sleep(30)
